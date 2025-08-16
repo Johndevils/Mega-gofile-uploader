@@ -4,18 +4,13 @@ import tempfile
 import requests
 import time
 import threading
-import base64
-import json
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import unpad
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 from telegram import Update, ParseMode
 
 # Configuration
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_FILE = "admins.txt"
-STATS_FILE = "bot_stats.json"
-ADMIN_PANEL_URL = os.getenv("ADMIN_PANEL_URL", "http://localhost:5000")
+CLOUDFLARE_WORKER_URL = os.getenv("CLOUDFLARE_WORKER_URL", "https://your-worker-name.your-subdomain.workers.dev")
+API_KEY = os.getenv("API_KEY", "your_secure_api_key")
 DOCUMENT_AS_FILE = os.getenv("DOCUMENT_AS_FILE", "True").lower() == "true"
 USE_THUMBNAIL = os.getenv("USE_THUMBNAIL", "True").lower() == "true"
 
@@ -24,14 +19,25 @@ admin_ids = []
 stats_lock = threading.Lock()
 
 def load_admins():
-    """Load admin IDs from file"""
+    """Load admin IDs from Cloudflare Worker"""
     global admin_ids
     try:
-        if os.path.exists(ADMIN_FILE):
-            with open(ADMIN_FILE, 'r') as f:
-                admin_ids = [int(line.strip()) for line in f if line.strip().isdigit()]
+        response = requests.get(
+            f"{CLOUDFLARE_WORKER_URL}/stats",
+            headers={"X-API-Key": API_KEY},
+            timeout=5
+        )
+        response.raise_for_status()
+        data = response.json()
+        admin_ids = data.get("admin_ids", [])
     except Exception as e:
         print(f"Error loading admins: {str(e)}")
+        # Fallback to environment variable if API fails
+        if 'INITIAL_ADMIN' in os.environ:
+            try:
+                admin_ids = [int(os.environ['INITIAL_ADMIN'])]
+            except:
+                admin_ids = []
 
 def is_admin(user_id: int) -> bool:
     """Check if user is admin"""
@@ -51,25 +57,18 @@ def admin_only(func):
     return wrapper
 
 def update_stats(success=True):
-    """Update bot statistics via admin panel API"""
+    """Update bot statistics via Cloudflare Worker API"""
     try:
         response = requests.post(
-            f"{ADMIN_PANEL_URL}/stats",
+            f"{CLOUDFLARE_WORKER_URL}/api/update_stats",
             json={"success": success},
+            headers={"X-API-Key": API_KEY},
             timeout=5
         )
         if response.status_code != 200:
             print(f"Failed to update stats: {response.text}")
     except Exception as e:
         print(f"Error updating stats: {str(e)}")
-
-def decrypt_key(enc_key, shared_key):
-    """Decrypt Mega key using shared key"""
-    key = shared_key[:16]
-    iv = shared_key[16:32]
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    decrypted = cipher.decrypt(enc_key)
-    return unpad(decrypted, AES.block_size)
 
 def mega_download_url(url, output_path):
     """Download file from Mega.nz without mega.py dependency"""
@@ -89,10 +88,6 @@ def mega_download_url(url, output_path):
     file_key = parts[0]
     shared_key = parts[1] if len(parts) > 1 else ""
     
-    # Convert keys to bytes
-    file_key_bytes = base64.urlsafe_b64decode(file_key + '==')
-    shared_key_bytes = base64.urlsafe_b64decode(shared_key + '==') if shared_key else b''
-    
     # Get file attributes
     api_url = f"https://g.api.mega.co.nz/cs?id=1&n={file_id}"
     payload = [{
@@ -109,11 +104,8 @@ def mega_download_url(url, output_path):
         raise Exception(f"Failed to get download URL: {data}")
     
     download_url = data["g"]
-    file_size = data["s"]
     
     # Download the file
-    print(f"Downloading {file_size} bytes from {download_url}...")
-    
     response = requests.get(download_url, stream=True)
     response.raise_for_status()
     
@@ -235,7 +227,9 @@ def start(update: Update, context: CallbackContext):
         "• Automatic file conversion\n"
         "• Direct download links\n\n"
         "📌 *Example:*\n"
-        "`/gofile https://mega.nz/file/mhJyxLxS#kTpYLbOMIxzLYUGedovrzL1ds3hJhIuDtr3XsLFd5F8`",
+        "`/gofile https://mega.nz/file/mhJyxLxS#kTpYLbOMIxzLYUGedovrzL1ds3hJhIuDtr3XsLFd5F8`\n\n"
+        "🔒 *Admin Panel:*\n"
+        "Access the admin panel at: " + CLOUDFLARE_WORKER_URL,
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -268,15 +262,11 @@ def admin_command(update: Update, context: CallbackContext):
             message.reply_text("❌ Invalid user ID. Must be a number")
             return
             
-        if new_admin_id in admin_ids:
-            message.reply_text(f"⚠️ User `{new_admin_id}` is already an admin", parse_mode=ParseMode.MARKDOWN)
-            return
-            
-        # Send request to admin panel to add admin
+        # Send request to Cloudflare Worker to add admin
         try:
             response = requests.post(
-                f"{ADMIN_PANEL_URL}/add_admin",
-                data={"admin_id": new_admin_id},
+                f"{CLOUDFLARE_WORKER_URL}/admin/add/{new_admin_id}",
+                headers={"X-API-Key": API_KEY},
                 timeout=5
             )
             result = response.json()
@@ -303,11 +293,11 @@ def admin_command(update: Update, context: CallbackContext):
             message.reply_text(f"⚠️ User `{remove_id}` is not an admin", parse_mode=ParseMode.MARKDOWN)
             return
             
-        # Send request to admin panel to remove admin
+        # Send request to Cloudflare Worker to remove admin
         try:
             response = requests.post(
-                f"{ADMIN_PANEL_URL}/remove_admin",
-                data={"admin_id": remove_id},
+                f"{CLOUDFLARE_WORKER_URL}/admin/remove/{remove_id}",
+                headers={"X-API-Key": API_KEY},
                 timeout=5
             )
             result = response.json()
@@ -341,22 +331,40 @@ def setup_initial_admin():
     """Set up initial admin if no admins exist"""
     global admin_ids
     
-    # Check if admins file exists
-    if not os.path.exists(ADMIN_FILE) and 'INITIAL_ADMIN' in os.environ:
-        try:
+    # Check if we can get admins from Cloudflare Worker
+    try:
+        response = requests.get(
+            f"{CLOUDFLARE_WORKER_URL}/stats",
+            headers={"X-API-Key": API_KEY},
+            timeout=5
+        )
+        response.raise_for_status()
+        data = response.json()
+        admin_ids = data.get("admin_ids", [])
+        
+        # If no admins and INITIAL_ADMIN is set, add it
+        if not admin_ids and 'INITIAL_ADMIN' in os.environ:
             initial_admin = int(os.environ['INITIAL_ADMIN'])
-            # Send request to admin panel to add admin
             response = requests.post(
-                f"{ADMIN_PANEL_URL}/add_admin",
-                data={"admin_id": initial_admin},
+                f"{CLOUDFLARE_WORKER_URL}/admin/add/{initial_admin}",
+                headers={"X-API-Key": API_KEY},
                 timeout=5
             )
             if response.status_code == 200:
                 print(f"✅ Created initial admin: {initial_admin}")
+                admin_ids = [initial_admin]
             else:
                 print(f"❌ Failed to create initial admin: {response.text}")
-        except Exception as e:
-            print(f"❌ Error setting up initial admin: {str(e)}")
+    except Exception as e:
+        print(f"⚠️ Could not connect to Cloudflare Worker: {str(e)}")
+        # Fallback to environment variable
+        if 'INITIAL_ADMIN' in os.environ:
+            try:
+                initial_admin = int(os.environ['INITIAL_ADMIN'])
+                admin_ids = [initial_admin]
+                print(f"✅ Using INITIAL_ADMIN as fallback: {initial_admin}")
+            except Exception as e:
+                print(f"❌ Error setting up initial admin: {str(e)}")
 
 def main():
     """Start the bot."""
@@ -394,6 +402,4 @@ def main():
     updater.idle()
 
 if __name__ == '__main__':
-    # Wait for web service to start
-    time.sleep(5)
     main()
