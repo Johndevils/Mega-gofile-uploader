@@ -1,0 +1,6 @@
+{
+  "name": "admin_panel_data",
+  "binding": "KV_NAMESPACE",
+  "preview_id": "preview-id-here",
+  "id": "your-kv-namespace-id"
+}
