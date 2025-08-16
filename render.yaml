@@ -1,30 +1,10 @@
-# Mega to GoFile Telegram Bot - Render Blueprint
-# Deploy the entire system with one click
-
 services:
-  - type: web
-    name: mega-gofile-web
-    region: oregon
-    plan: free
-    runtime: python
-    branch: main
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --bind 0.0.0.0:$PORT web:app
-    envVars:
-      - key: ADMIN_PANEL_PASSWORD
-        generateValue: true
-        description: "Password for admin panel access (auto-generated)"
-      - key: PORT
-        value: "10000"
-        description: "Port for the web service"
-
   - type: worker
     name: mega-gofile-worker
     region: oregon
     plan: free
     runtime: python
     branch: main
-    dependsOn: [mega-gofile-web]
     buildCommand: pip install -r requirements.txt
     startCommand: python worker.py
     envVars:
@@ -34,14 +14,13 @@ services:
       - key: INITIAL_ADMIN
         sync: false
         description: "Your Telegram User ID (from @userinfobot)"
-      - key: ADMIN_PANEL_URL
-        fromService:
-          name: mega-gofile-web
-          property: url
-        description: "URL of the web service (auto-detected)"
+      - key: CLOUDFLARE_WORKER_URL
+        value: "https://mega-gofile-admin-panel.your-subdomain.workers.dev"
+        description: "URL of your Cloudflare Worker"
+      - key: API_KEY
+        value: "your_secure_api_key_here"
+        description: "Must match the API_KEY in wrangler.toml"
       - key: DOCUMENT_AS_FILE
         value: "True"
-        description: "Send documents as files instead of media"
       - key: USE_THUMBNAIL
         value: "True"
-        description: "Use thumbnails for media"
